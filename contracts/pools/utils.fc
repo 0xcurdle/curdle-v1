@@ -1,0 +1,436 @@
+#include "../imports/stdlib.fc";
+#include "opcodes.fc";
+#include "../common/constants.fc";
+#include "../common/workchain.fc";
+
+(int) is_provide_one_liquidity?(int target) { ;; check if target is a power of 2, if it is, means that only one liquidity is provided
+    return (target & (target - 1)) == 0;
+}
+
+(int) is_target_metapool?(int target) { ;; check if target is a metapool
+    return target >= 1 << const::n_coins;
+}
+
+(int) get_asset_index(cell storage::wallet_indexes, slice asset) inline_ref {
+    (_, slice asset_slice, _, int ok?) = pfxdict_get?(storage::wallet_indexes, 267, asset);
+    ;; Check we have the asset in the wallet
+    throw_unless(error::invalid_key, ok?);
+    int asset_index = asset_slice~load_uint(const::key_size);
+    return asset_index;
+}
+
+() mint_lp(slice to_address, cell jetton_wallet_code, int amount, int query_id, int ton_value) impure inline_ref {
+    cell state_init = calculate_jetton_wallet_state_init(to_address, my_address(), jetton_wallet_code);
+    slice to_wallet_address = get_address(state_init);
+
+    var body = begin_cell()
+    .store_uint(op::internal_transfer, 32)
+    .store_uint(query_id, 64)
+    .store_coins(amount)
+    .store_slice(my_address())
+    .store_slice(to_address)
+    .store_coins(0) 
+    .store_uint(0, 1)
+    .end_cell();
+
+    deploy(BOUNCEABLE, to_wallet_address, ton_value ,body, state_init, SEND_MODE_REGULAR);
+}
+
+() debug::storage() impure inline {
+    (slice r1, int ok1?) = pool::reserves.udict_get?(const::key_size, 1);
+    (slice r2, int ok2?) = pool::reserves.udict_get?(const::key_size, 2);
+    (slice r3, int ok3?) = pool::reserves.udict_get?(const::key_size, 4);
+    ~strdump("debug::storage");
+    ~dump(r1~load_coins());
+    ~dump(r2~load_coins());
+    ~dump(r3~load_coins());
+}
+
+cell pack_lp_account_init_data(int query_id, slice pool_address, slice recipient, int target) inline {
+    return begin_cell()
+        .store_slice(pool_address)
+        .store_slice(recipient)
+		.store_uint(target, const::key_size)
+		.store_uint(0, const::key_size)
+        .store_query_id(query_id)
+		.store_dict(new_dict())
+    .end_cell();
+}
+
+;; Get lp_account state init
+cell get_lp_account_state_init(int query_id, slice pool_address, slice user_address, int target, cell lp_account_code) inline_ref {  
+    return begin_cell()
+    .store_uint(0, 2) ;; 0b00 - No split_depth; No special
+    .store_maybe_ref(lp_account_code)
+    .store_maybe_ref(
+        pack_lp_account_init_data(query_id, pool_address, user_address, target)
+    )
+    .store_uint(0, 1) ;; Empty libraries
+    .end_cell();
+}
+
+(int, int) get_sum_and_product(cell balances) inline_ref {
+    int sum = 0;
+    int product = 1;
+
+    int incr = 1;
+    repeat(const::n_coins) {
+        (slice asset_balances_slice, int ok?) = balances.udict_get?(const::key_size, incr);
+        ;; TODO: throw error if ok? == 0
+        int balance = ok? ? asset_balances_slice~load_coins() : 0;
+        sum += balance;
+        product *= balance;
+        incr <<= 1;
+    }
+
+    return (sum, product);
+}
+
+(int, int) get_other_sum_and_product(cell balances, int token_out) inline_ref {
+    int sum_other = 0;
+    int product_other = 1;
+
+    int incr = 1;
+    repeat(const::n_coins) {
+        (slice asset_balances_slice, int ok?) = balances.udict_get?(const::key_size, incr);
+        int balance = ok? ? asset_balances_slice~load_coins() : 0;
+        if (incr != token_out) {
+            sum_other += balance;
+            product_other *= balance;
+        } 
+        incr <<= 1;
+    }   
+
+    return (sum_other, product_other);
+}
+
+int get_D(int sum, int product, int A) inline_ref {
+    int D_prev = 0;
+
+    if (sum == 0) {
+        return 0;
+    }
+    int D = sum;
+    int ann = A * const::n_coins;
+
+    repeat(255) {
+        int D_p = D;
+        repeat(const::n_coins) {
+            D_p = D_p * (D / const::n_coins);
+        }
+
+        D_p = D_p / product;
+
+        D_prev = D;
+        D = (ann * sum / const::a_precision + D_p * const::n_coins) * D / ((ann - const::a_precision) * D / const::a_precision + (const::n_coins + 1) * D_p);
+
+        if (D > D_prev) {
+            if (D - D_prev <= 1) {
+                return D;
+            }
+        } else {
+            if (D_prev - D <= 1){
+                return D;
+            }
+        }
+    }
+    return -1;
+}
+
+int get_y(int D, int other_sum, int other_product, int A) inline_ref {
+    int ann = A * const::n_coins;
+    int c = D;
+    int y_prev = 0;
+	
+    c = c * (D / const::n_coins) * (D / const::n_coins) / other_product;
+
+    c = c * D * const::a_precision / (ann * const::n_coins);
+    int b = other_sum + D * const::a_precision / ann;
+    int y = D;
+
+    repeat (255) {
+        y_prev = y;
+        y = (y * y + c) / (2 * y + b - D);
+        if (y > y_prev) {
+            if (y - y_prev <= 1) {
+                return y;
+            }
+        } else {
+            if (y_prev - y <= 1) {
+                return y;
+            }
+        }
+    }
+    return -1;
+}
+
+int get_virtual_price(cell reserves, int A, int total_supply) inline_ref {
+    if (total_supply == 0) {
+        return const::virtual_price_precision;
+    }
+    (int sum, int product) = get_sum_and_product(reserves);
+    int D = get_D(sum, product, A);
+    return muldiv(D, const::virtual_price_precision, total_supply);
+}
+
+cell add_reserve_amount(cell reserve_old, cell add_amount) inline_ref {
+    ;; TODO: gas too expensive, try to use array instead
+    int incr = 1;
+    cell new_tmp_reserves = new_dict();
+    repeat(const::n_coins) {
+        ;; Deposit amount of each asset
+        (slice asset_balances_slice, int add_amount_ok?) = add_amount.udict_get?(const::key_size, incr);
+
+        ;; Pool reserves
+        (slice reserves_slice, int reserve_old_ok?) = reserve_old.udict_get?(const::key_size, incr);
+        if((~ reserve_old_ok?) & (add_amount_ok?)) {
+            new_tmp_reserves~udict_set(const::key_size, incr, asset_balances_slice);
+        }
+        elseif((reserve_old_ok?) & (add_amount_ok?)) {
+            int old_reserve = reserves_slice~load_coins();
+            int add_amount = asset_balances_slice~load_coins();
+            int new_reserve = old_reserve + add_amount;
+            new_tmp_reserves~udict_set(const::key_size, incr, begin_cell().store_coins(new_reserve).end_cell().begin_parse());
+        }
+        elseif((reserve_old_ok?) & (~ add_amount_ok?)) {
+            new_tmp_reserves~udict_set(const::key_size, incr, reserves_slice);
+        }
+        incr <<= 1;
+    }
+    return new_tmp_reserves;
+}
+
+(cell, int) get_fee(int D_1, int D_0, cell new_reseve, int fee) inline {
+    int incr = 1;
+    cell fees = new_dict();
+    repeat(const::n_coins) {
+        ;; Admin Balance
+        (slice admin_balance_slice, int admin_balance_ok?) = pool::admin_fee_balances.udict_get?(const::key_size, incr);
+        int admin_balance = admin_balance_ok? ? admin_balance_slice~load_coins() : 0;
+        
+        ;; Deposit amount of each asset
+        (slice new_reserve_slice, int add_amount_ok?) = new_reseve.udict_get?(const::key_size, incr);
+        int new_reserve_amount = add_amount_ok? ? new_reserve_slice~load_coins() : 0;
+
+        ;; Pool reserves
+        (slice old_reserves_slice, int reserve_old_ok?) = pool::reserves.udict_get?(const::key_size, incr);
+        int old_reserve_amount = reserve_old_ok? ? old_reserves_slice~load_coins() : 0;
+
+        int ideal_balance = D_1 * old_reserve_amount / D_0;
+        int difference = 0;
+        if(ideal_balance > new_reserve_amount) {
+            difference = ideal_balance - new_reserve_amount;
+        } else {
+            difference = new_reserve_amount - ideal_balance;
+        }
+        int fee_for_reserve = difference * fee / const::fee_denominator;
+        int fee_for_admin = fee_for_reserve * pool::admin_fee / const::fee_denominator;
+
+        ;; 100000000000000 - 37278728219 = 
+
+        ;; Update reserve balance
+        pool::reserves~udict_set(
+            const::key_size, 
+            incr, 
+            begin_cell()
+                .store_coins(new_reserve_amount - fee_for_admin)
+            .end_cell().begin_parse()
+        );
+
+        ;; Update admin balance
+        pool::admin_fee_balances~udict_set(
+            const::key_size, 
+            incr, 
+            begin_cell()
+                .store_coins(admin_balance + fee_for_admin)
+            .end_cell().begin_parse()
+        );
+
+        ;; Update fee
+        fees~udict_set(
+            const::key_size, 
+            incr, 
+            begin_cell()
+                .store_coins(fee_for_reserve)
+            .end_cell().begin_parse()
+        );
+
+        ;; Calculate new_reserve with fee
+        new_reseve~udict_set(
+            const::key_size, 
+            incr, 
+            begin_cell()
+                .store_coins(new_reserve_amount - fee_for_reserve)
+            .end_cell().begin_parse()
+        );
+        incr <<= 1;
+    }
+
+    (int sum, int product) = get_sum_and_product(new_reseve);
+    int D_2 = get_D(sum, product, pool::A);
+    int mint_lp_amount = pool::total_supply_lp * (D_2 - D_0) / D_0;
+
+    return (fees, mint_lp_amount);
+}
+
+cell pack_refund_data(query_id) inline {
+    cell msg_body = begin_cell()
+        .store_op(op::excesses)
+        .store_query_id(query_id)
+        .end_cell();
+
+    return msg_body;
+}
+
+(cell, int, int) simulate::add_liquidity(
+    int ctx::value,   
+    int target,         ;; binary indexer of asset
+    int min_lp_amount,  ;; minimum amount of LP tokens to receive
+    cell balances       ;; dictionary of asset balances {asset_index: amount}
+) inline {
+    ;; If total supply is 0, then all assets must be deposited
+    throw_unless(error:must_depoist_all_assets, ((pool::total_supply_lp == 0) & (target == 7)) | (pool::total_supply_lp  > 0));
+
+    (int sum, int product) = get_sum_and_product(pool::reserves);
+    int D_0 = get_D(sum, product, pool::A);
+
+    throw_unless(error::no_suitable_D, D_0 >= 0);
+    cell new_tmp_reserves = add_reserve_amount(pool::reserves, balances);
+
+    ;; Calculate D_1
+    (int sum, int product) = get_sum_and_product(new_tmp_reserves);
+    int D_1 = get_D(sum, product, pool::A);
+
+    throw_unless(error::no_suitable_D, D_1 >= 0);
+    throw_unless(error::invalid_liquidity, D_1 > D_0);
+    
+    int mint_lp_amount = 0;
+    cell fees = new_dict();
+    if(pool::total_supply_lp == 0) {
+        pool::total_supply_lp = D_1;
+        pool::reserves = add_reserve_amount(pool::reserves, balances);
+        mint_lp_amount = D_1;
+    } else {
+        int D_2 = D_1;
+        int fee_add_liquidity = pool::fee * const::n_coins / (4 * (const::n_coins - 1));
+
+        (fees, mint_lp_amount) = get_fee(D_1, D_0, new_tmp_reserves, fee_add_liquidity); 
+        pool::total_supply_lp += mint_lp_amount;
+
+    }
+
+    return (fees, mint_lp_amount, ctx::value);
+}
+
+(int, int) calc_admin_fee(int key_index, int swap_fee) inline {
+    (slice admin_fee_slice, int ok?) = pool::admin_fee_balances.udict_get?(const::key_size, key_index);
+    int admin_fee_before = ok? ? admin_fee_slice~load_coins() : 0;
+    int fee_for_admin = swap_fee * pool::admin_fee / const::fee_denominator;
+
+    return (admin_fee_before, fee_for_admin);
+}
+
+(cell, int, int, int) simulate::get_amount_out(cell reserves_before, int token_in, int token_out, int amount_in) inline {
+    cell reserves_after = reserves_before;
+    (slice token_in_slice, int ok?) = reserves_after.udict_get?(const::key_size, token_in);
+    int reserve_in_before = ok? ? token_in_slice~load_coins() : 0;
+    reserves_after~udict_set(const::key_size, token_in, begin_cell().store_coins(reserve_in_before + amount_in).end_cell().begin_parse());
+
+    (int sum, int product) = get_sum_and_product(reserves_before);
+    throw_unless(error::exist_zero_reserve, product > 0 & (sum > 0));
+    (int sum_other, int product_other) = get_other_sum_and_product(reserves_after, token_out);
+    int reserve_out_after = get_y(get_D(sum, product, pool::A), sum_other, product_other, pool::A);
+    (slice token_out_slice, int ok?) = reserves_before.udict_get?(const::key_size, token_out);
+    int reserve_out_before = ok? ? token_out_slice~load_coins() : 0;
+
+    int amount_out = reserve_out_before - reserve_out_after;
+    ;; get_fee
+    int swap_fee = amount_out * pool::fee / const::fee_denominator;
+    amount_out -= swap_fee;
+    (int admin_fee_before, int fee_for_admin) = calc_admin_fee(token_out, swap_fee);
+    reserve_out_after = reserve_out_before - amount_out - fee_for_admin;
+    reserves_after~udict_set(const::key_size, token_out, begin_cell().store_coins(reserve_out_after).end_cell().begin_parse()); 
+
+    return (reserves_after, amount_out, swap_fee, admin_fee_before + fee_for_admin);
+}
+
+(cell) simulate::remove_liquidity_all(int remove_lp_amount) {
+    ;; calculate the amount of assets to be returned
+    int incr = 1;
+    cell  amount_outs = new_dict();
+    repeat(const::n_coins) {
+        (slice reserve_slice, int ok?) = pool::reserves.udict_get?(const::key_size, incr);
+        if (ok?) {
+            int reserve = reserve_slice~load_coins();
+            int asset_amount_out = remove_lp_amount * reserve / pool::total_supply_lp;
+            amount_outs~udict_set(const::key_size, incr, begin_cell().store_coins(asset_amount_out).end_cell().begin_parse()); 
+
+            ;; Update reserves
+            pool::reserves~udict_set(const::key_size, incr, begin_cell().store_coins(reserve - asset_amount_out).end_cell().begin_parse());
+        }
+        incr <<= 1;
+    }
+
+    ;; Update total supply of LP tokens
+    pool::total_supply_lp -= remove_lp_amount;
+    return amount_outs;
+}
+
+
+(cell, cell, int, int) simulate::remove_liquidity_one(
+    int remove_amount,
+    int token_out
+) inline {
+    ;; Calculate with one coin
+    (int sum, int product) = get_sum_and_product(pool::reserves);
+    (int sum_other, int product_other) = get_other_sum_and_product(pool::reserves, token_out);
+    int D_0 = get_D(sum, product, pool::A);
+    int D_1 = D_0 - remove_amount * D_0 / pool::total_supply_lp;
+
+    int new_y = get_y(D_1, sum_other, product_other, pool::A);
+
+    int remove_fee = pool::fee * const::n_coins / (4 * (const::n_coins - 1));
+    int incr = 1;
+    int reserve_out = 0;
+    int reduced_sum_other = 0;
+    int reduced_reserve_out = 0;
+    int reduced_product_other = 1;
+    repeat(const::n_coins) {
+        (slice reserve_slice, int ok?) = pool::reserves.udict_get?(const::key_size, incr);
+        int reserve_amount = ok? ? reserve_slice~load_coins() : 0;
+        if(incr == token_out) {
+            int dx_expected = (reserve_amount * D_1 / D_0) - new_y;
+            reduced_reserve_out = reserve_amount - dx_expected * remove_fee / const::fee_denominator;
+            reserve_out = reserve_amount;
+        }
+        else {
+            int dx_expected = reserve_amount - (reserve_amount * D_1 / D_0);
+            int reduced_reserve_amount = reserve_amount - dx_expected * remove_fee / const::fee_denominator;
+            reduced_sum_other += reduced_reserve_amount;
+            reduced_product_other *= reduced_reserve_amount;
+        }
+        incr <<= 1;
+    }
+    int d_y = reduced_reserve_out - get_y(D_1, reduced_sum_other, reduced_product_other, pool::A);
+    int d_y_fee = reserve_out - new_y - d_y;
+
+
+    (slice reserve_slice, int ok?) = pool::reserves.udict_get?(const::key_size, token_out);
+    int reserve_amount = ok? ? reserve_slice~load_coins() : 0;
+    (int admin_fee_before, int fee_for_admin) = calc_admin_fee(token_out, d_y_fee);
+
+    pool::reserves~udict_set(const::key_size, token_out, begin_cell().store_coins(reserve_amount - (d_y + fee_for_admin)).end_cell().begin_parse());
+
+    ;; Update admin balance
+    pool::admin_fee_balances~udict_set(const::key_size, token_out, begin_cell().store_coins(admin_fee_before + fee_for_admin).end_cell().begin_parse());
+
+    ;; Update total supply of LP tokens
+    pool::total_supply_lp -= remove_amount;
+
+    cell amount_outs = new_dict();
+    cell fees = new_dict();
+    amount_outs~udict_set(const::key_size, token_out, begin_cell().store_coins(d_y).end_cell().begin_parse());
+    fees~udict_set(const::key_size, token_out, begin_cell().store_coins(d_y_fee).end_cell().begin_parse());
+
+    return (amount_outs, fees, d_y, d_y_fee);
+}

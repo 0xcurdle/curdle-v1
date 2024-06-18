@@ -1,0 +1,142 @@
+const MIN_STORAGE_DURATION = 72 * 3600; ;; 3 days
+
+;; Contract code bits and cells
+const POOL_BITS  = 38134;
+const POOL_CELLS = 118;
+const LP_ACCOUNT_INITSTATE_BITS  = 2756;
+const LP_ACCOUNT_INITSTATE_CELLS = 9;
+
+;; Jetton transfer fees
+const JETTON_NOTIFY_GAS_CONSUMPTION = 16721;
+const SEND_TRANSFER_GAS_CONSUMPTION    = 9255;
+const RECEIVE_TRANSFER_GAS_CONSUMPTION = 10355;
+
+;; Add Liquidity gas consumption
+const ADD_TON_LIQUIDITY_GAS_CONSUMPTION = 15941;
+const DEPOSIT_TON_GAS_CONSUMPTION = 4580;
+const DEPOSIT_JETTON_1_GAS_CONSUMPTION = 5940;
+const DEPOSIT_JETTON_2_GAS_CONSUMPTION = 9134;
+const ADD_ONE_LIQUIDITY_GAS_CONSUMPTION = 63991;
+const DEPOSIT_ALL_GAS_CONSUMPTION = 40551;
+
+;; Remove All
+const REMOVE_ALL_GAS_CONSUMPTION = 30801;
+
+;; Remove One Asset
+const REMOVE_ONE_LIQUIDITY_GAS_CONSUMPTION = 51894; ;; TON 49782
+
+;; Swap Fee
+const SWAP_GAS_CONSUMPTION = 30080; ;; Jetton -> Jetton: 28970; TON -> TON: 28970; Jetton -> TON: 28761; TON -> Jetton: 28083
+
+
+const SEND_BACK_FEE = 31000000;
+const TOP_UP_FEE = 11670;
+const DEPLOY_POOL_FEE = 30000000;
+
+;; Emit log fees
+const emit_log_gas_consumption = 2800000;
+
+int calculate_pool_min_storage_fee() inline {
+    return get_storage_fee(MY_WORKCHAIN, MIN_STORAGE_DURATION, POOL_BITS, POOL_CELLS);
+}
+
+int forward_init_state_overhead() inline {
+    return get_simple_forward_fee(MY_WORKCHAIN, LP_ACCOUNT_INITSTATE_BITS, LP_ACCOUNT_INITSTATE_CELLS);
+}
+
+int get_jetton_transfer_fee() inline {
+    int pool_gas_comsumption = get_precompiled_gas_consumption();
+    int send_transfer_gas_consumption = null?(pool_gas_comsumption) ? SEND_TRANSFER_GAS_CONSUMPTION : pool_gas_comsumption;
+    int receive_transfer_gas_consumption = null?(pool_gas_comsumption) ? RECEIVE_TRANSFER_GAS_CONSUMPTION : pool_gas_comsumption;
+    return get_compute_fee(MY_WORKCHAIN, send_transfer_gas_consumption) + get_compute_fee(MY_WORKCHAIN, receive_transfer_gas_consumption);
+}
+
+(int, int) deposit_fee(int fwd_fee, int deposit_type) inline {
+    int pool_gas_comsumption = get_precompiled_gas_consumption();
+
+    int add_liquidity_gas_consumption = ADD_TON_LIQUIDITY_GAS_CONSUMPTION;
+    int deposit_asset_consumption = DEPOSIT_TON_GAS_CONSUMPTION;
+
+    if(deposit_type == 0) {
+        add_liquidity_gas_consumption = DEPOSIT_JETTON_2_GAS_CONSUMPTION;
+        deposit_asset_consumption = DEPOSIT_JETTON_2_GAS_CONSUMPTION;
+    }
+
+    int add_ton_liquidity_gas_consumption = null?(pool_gas_comsumption) ? add_liquidity_gas_consumption : pool_gas_comsumption;
+    int deposit_gas_consumption = null?(pool_gas_comsumption) ? deposit_asset_consumption : pool_gas_comsumption;
+    int deposit_all_gas_consumption = null?(pool_gas_comsumption) ? DEPOSIT_ALL_GAS_CONSUMPTION : pool_gas_comsumption;
+
+    int gas_comp = get_compute_fee(MY_WORKCHAIN, add_ton_liquidity_gas_consumption) + 
+    calculate_pool_min_storage_fee();
+    
+
+    int total_fee = gas_comp + 
+    fwd_fee * 5  + 
+    forward_init_state_overhead() * 2 + 
+    get_compute_fee(MY_WORKCHAIN, deposit_gas_consumption) +
+    get_compute_fee(MY_WORKCHAIN, deposit_all_gas_consumption) +
+    get_jetton_transfer_fee() +
+    emit_log_gas_consumption;
+
+    return (total_fee, gas_comp);
+}
+
+(int, int) add_one_liquidity_fee(int fwd_fee) inline {
+    int pool_gas_comsumption = get_precompiled_gas_consumption();
+    int add_one_liquidity_gas_consumption = null?(pool_gas_comsumption) ? ADD_ONE_LIQUIDITY_GAS_CONSUMPTION : pool_gas_comsumption;
+
+    int gas_comp = get_compute_fee(MY_WORKCHAIN, add_one_liquidity_gas_consumption) + 
+    calculate_pool_min_storage_fee() + 
+    forward_init_state_overhead() +
+    emit_log_gas_consumption;
+
+    int total_fee = gas_comp + 
+    fwd_fee * 3 +
+    forward_init_state_overhead() + 
+    get_jetton_transfer_fee();
+
+    return (total_fee, gas_comp);
+}
+
+(int, int) remove_liquidity_fee(int fwd_fee, int remove_type) inline {
+    int pool_gas_comsumption = get_precompiled_gas_consumption();
+
+    int fwd_num = 7;
+    int remove_gas_fee = REMOVE_ALL_GAS_CONSUMPTION;
+    if (remove_type == 1) {
+        remove_gas_fee = REMOVE_ONE_LIQUIDITY_GAS_CONSUMPTION;
+        fwd_num = 3;
+    }
+    int remove_gas_consumption = null?(pool_gas_comsumption) ? remove_gas_fee : pool_gas_comsumption;
+
+
+    int gas_comp = get_compute_fee(MY_WORKCHAIN, remove_gas_consumption) + 
+    calculate_pool_min_storage_fee() +
+    emit_log_gas_consumption;
+    
+
+    int total_fee = gas_comp + 
+    fwd_fee * fwd_num +
+    get_jetton_transfer_fee();
+
+    return (total_fee, gas_comp);
+}
+
+(int, int) swap_fee(int fwd_fee) inline {
+    int pool_gas_comsumption = get_precompiled_gas_consumption();
+    int swap_gas_consumption = null?(pool_gas_comsumption) ? SWAP_GAS_CONSUMPTION : pool_gas_comsumption;
+
+    int gas_comp = get_compute_fee(MY_WORKCHAIN, swap_gas_consumption) + 
+    calculate_pool_min_storage_fee() +
+    emit_log_gas_consumption;
+    
+    int total_fee = gas_comp + 
+    fwd_fee * 3 + 
+    get_jetton_transfer_fee();
+
+    return (total_fee, gas_comp);
+}
+
+(int) deposit_all_fee() inline {
+    return get_compute_fee(MY_WORKCHAIN, DEPOSIT_ALL_GAS_CONSUMPTION) + emit_log_gas_consumption + forward_init_state_overhead();
+}

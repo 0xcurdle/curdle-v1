@@ -1,0 +1,78 @@
+#include "imports/stdlib.fc";
+;; common import
+#include "common/constants.fc";
+#include "common/errors.fc";
+#include "common/opcodes.fc";
+#include "common/utils.fc";
+#include "common/workchain.fc";
+;; pool import 
+#include "pools/opcodes.fc";
+;; lp account import
+#include "lp_accounts/storages.fc";
+#include "lp_accounts/utils.fc";
+
+() handle::deposit_asset(
+    int deposit_amount,
+    int min_lp_amount,
+    int asset_index,
+    slice provider,
+    int query_id
+) impure inline {
+    ;; If this asset was already added, pool have to send this asset back. TODO: need to send asset back
+    throw_if(error:asset_already_added, lp_account::current & asset_index);
+
+    ;; Set new asset balance
+    slice deposit_amount_slice = begin_cell().store_coins(deposit_amount).end_cell().begin_parse();
+    lp_account::balances~udict_set(const::key_size, asset_index, deposit_amount_slice);
+
+    lp_account::current |= asset_index;
+
+    ;; If current is equal to target, then pool will send deposit_all to pool
+    if(lp_account::current == lp_account::target) {
+        cell msg_body = pack_deposit_all_data(lp_account::recipient, lp_account::target, lp_account::balances, provider, min_lp_amount, query_id);
+        transfer_ton(BOUNCEABLE, lp_account::pool_addr, 0, msg_body, SEND_MODE_DESTROY + SEND_MODE_CARRY_ALL_BALANCE);
+    }
+
+    ;; Save data to the storage
+    lp_account::save_data();
+    return ();
+}
+
+
+() route_internal(slice ctx::sender, int ctx::value, int ctx::fwd_fee, slice ctx::body) impure inline {
+    ;; load op and query id
+    (int op, int query_id) = ctx::body~load_op_and_query_id();
+
+    ;; Load data from storage
+    lp_account::load_data();
+
+    if op == op::deposit_asset { ;; deposit more than one asset as liquidity, send from lp account contract
+        throw_unless(error::invalid_query_id, query_id == lp_account::query_id);
+
+        ;; Only pool can send this message
+        throw_unless(error::invalid_sender, equal_slices_bits(lp_account::pool_addr, ctx::sender));
+        
+        int deposit_amount = ctx::body~load_coins();
+        int min_lp_amount = ctx::body~load_coins();
+        int asset_index = ctx::body~load_uint(const::key_size);
+        slice provider = ctx::body~load_msg_addr();
+        return handle::deposit_asset(deposit_amount, min_lp_amount, asset_index, provider, query_id);
+    }
+
+    throw(error::invalid_op);
+}
+
+() main(int ctx::value, cell in_msg_full, slice ctx::body) impure {
+    slice s = in_msg_full.begin_parse();
+    int flags = s~load_msg_flags();
+
+    if (is_bounced(flags)) { ;; skip all bounced messages
+        return ();
+    }
+    
+    ;; get context
+    (slice ctx::sender, int ctx::fwd_fee) = s~retrieve_ctx(MY_WORKCHAIN);
+
+    ;; route function to handle internal message
+    route_internal(ctx::sender, ctx::value, ctx::fwd_fee, ctx::body);
+}

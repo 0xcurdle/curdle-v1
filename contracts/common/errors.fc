@@ -1,0 +1,25 @@
+
+const error::wrong_workchain = 333;     ;; wrong workchain
+const error::invalid_op = 0xffff;       ;; op is not supported
+const error::invalid_comment = 0xfffe;  ;; comment handler not defined
+const error::invalid_key = 404;         ;; key does not found in dictionary
+const error::invalid_data = 400;        ;; data is invalid
+const error::not_implemeted = 100;      ;; not implemented
+
+const error:only_pool_can_send = 2000;   ;; only pool can send this message
+const error:asset_already_added = 2001;  ;; asset already added
+const error:only_lp_account_can_send = 2002;  ;; only lp account can send this message
+const error:must_depoist_all_assets = 2003;     ;; must deposit all assets
+const error::no_suitable_D = 2004;
+const error::invalid_initial_reserves = 2005;
+const error::invalid_liquidity = 2006;
+const error::invalid_sender = 2007;      ;; invalid sender
+const error::invalid_asset_order = 2008; ;; invalid asset order
+const error::remove_zero_lp = 2009;
+const error::not_meet_min_amount = 2010;
+const error::invalid_query_id = 2011;    ;; invalid query id
+const error::not_enough_ton = 2012;
+const error::not_initialized = 2013;     ;; not initialized (tadpole != const::n_coins)
+const error::exist_zero_reserve = 2014;
+const error:invalid_swap = 2015;
+const error::already_inited = 2016;

@@ -1,0 +1,79 @@
+#include "../imports/stdlib.fc";
+#include "../common/opcodes.fc";
+
+;; logs
+const log::add_liquidity = "log_add_liquidity"c; ;;1d3037e
+const log::swap = "log_swap"c; ;;34fd6b14
+const log::remove_liquidity = "log_remove_liquidity"c; ;;a95d7721
+
+
+() log_add_liquidity(
+    slice provider,
+    slice recipient,
+    int liquidity,
+    int lp_supply,
+    int A,
+    cell all_deposit_amount,
+    cell reserves,
+    cell fees
+) impure inline_ref {
+    builder log = begin_cell()
+        .store_op(op::event_log)
+        .store_slice(provider)
+        .store_slice(recipient)
+        .store_coins(liquidity)
+        .store_coins(lp_supply)
+        .store_uint(A, 16)
+        .store_dict(all_deposit_amount)
+        .store_dict(reserves)
+        .store_dict(fees);
+
+    emit_log(log::add_liquidity, log);
+}
+
+() log_swap(
+    slice provider,
+    slice recipient,
+    int lp_supply,
+    int A,
+    cell swap_data,
+    cell reserves,
+    cell fees
+) impure inline_ref {
+    builder log = begin_cell()
+        .store_op(op::event_log)
+        .store_slice(provider)
+        .store_slice(recipient)
+        .store_coins(lp_supply)
+        .store_uint(A, 16)
+        .store_ref(swap_data)
+        .store_dict(reserves)
+        .store_dict(fees);
+
+    emit_log(log::swap, log);
+}
+
+() log_remove_liquidity(
+    slice provider,
+    slice recipient,
+    int liquidity,
+    int lp_supply,
+    int A,
+    cell all_withdraw_amount,
+    cell reserves,
+    cell fees
+) impure inline_ref {
+    builder log = begin_cell()
+        .store_op(op::event_log)
+        .store_op(log::remove_liquidity)
+        .store_slice(provider)
+        .store_slice(recipient)
+        .store_coins(liquidity)
+        .store_coins(lp_supply)
+        .store_uint(A, 16)
+        .store_dict(all_withdraw_amount)
+        .store_dict(reserves)
+        .store_dict(fees);
+
+    emit_log(log::remove_liquidity, log);
+}

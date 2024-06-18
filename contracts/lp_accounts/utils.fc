@@ -1,0 +1,13 @@
+cell pack_deposit_all_data(lp_account::recipient, int lp_account::target, cell lp_account::balances, slice provider, int min_lp_amount, query_id) inline {
+    cell msg_body = begin_cell()
+        .store_op(op::deposit_all)
+        .store_query_id(query_id)
+        .store_slice(lp_account::recipient)
+        .store_slice(provider)
+        .store_uint(lp_account::target, const::key_size)
+        .store_coins(min_lp_amount)
+        .store_dict(lp_account::balances)
+        .end_cell();
+
+    return msg_body;
+}

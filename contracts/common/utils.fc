@@ -1,0 +1,125 @@
+#include "../imports/stdlib.fc";
+#include "workchain.fc";
+#include "errors.fc";
+
+
+() deploy( ;; deploy contract with state_init
+    int bounce_flag,
+    slice receiver,
+    int value,
+    cell body,
+    cell state_init,
+    int mode
+) impure inline_ref {
+    var msg = begin_cell()
+        .store_msg_flags_and_address_none(bounce_flag)
+        .store_slice(receiver)
+        .store_coins(value)
+        .store_statinit_ref_and_body_ref(state_init, body)
+        .end_cell();
+    send_raw_message(msg, mode);
+}
+
+() transfer_ton( ;; transfer TON with body
+    int bounce_flag,
+    slice receiver,
+    int value,
+    cell body,
+    int mode
+) impure inline_ref {
+    var msg = begin_cell()
+        .store_msg_flags_and_address_none(bounce_flag)
+        .store_slice(receiver)
+        .store_coins(value)
+        .store_only_body_ref(body);
+    
+    send_raw_message(msg.end_cell(), mode);
+}
+
+() transfer_jetton(
+    int bounce_flag,
+    slice receiver, 
+    slice jetton_wallet, 
+    int jetton_amount, 
+    int ton_amount, 
+    int query_id, 
+    cell payload, 
+    int forward_ton,
+    int mode
+) impure inline_ref {
+
+    ;; send jetton transfer to jetton wallet
+    cell msg_body = begin_cell()
+	.store_uint(op::transfer, 32)
+	.store_uint(query_id, 64)
+	.store_coins(jetton_amount)
+	.store_slice(receiver)
+	.store_slice(receiver)
+	.store_uint(0, 1)
+	.store_coins(forward_ton)
+	.store_maybe_ref(payload)
+	.end_cell();
+
+
+    cell msg = begin_cell()
+	.store_msg_flags_and_address_none(bounce_flag)
+	.store_slice(jetton_wallet)
+	.store_coins(ton_amount)
+	.store_only_body_ref(msg_body)
+	.end_cell();
+
+    send_raw_message(msg, mode); 
+}
+
+slice get_address(cell state_init) inline_ref {
+    return begin_cell()
+    .store_uint(2, 2) ;; addr_std$10
+    .store_uint(0, 1) ;; anycast nothing
+    .store_int(MY_WORKCHAIN, 8)
+    .store_uint(cell_hash(state_init), 256)
+    .end_cell()
+    .begin_parse();
+}
+
+(cell) pack_provide_wallet_address(
+    slice jetton_master,
+    int value,
+    int query_id
+) inline_ref {
+    cell msg = begin_cell()
+        .store_msg_flags_and_address_none(BOUNCEABLE)
+        .store_slice(jetton_master) ;; dest
+        .store_coins(value)
+        .store_only_body_ref(begin_cell()
+            .store_op(op::provide_wallet_address)
+            .store_query_id(query_id)
+            .store_slice(my_address())
+            .store_bool(FALSE)
+            .end_cell()
+    ).end_cell();
+    return msg;
+}
+
+cell pack_jetton_wallet_data(int status, int balance, slice owner_address, slice jetton_master_address) inline_ref {
+    return begin_cell()
+    .store_uint(status, 4)
+    .store_coins(balance)
+    .store_slice(owner_address)
+    .store_slice(jetton_master_address)
+    .end_cell();
+}
+
+cell calculate_jetton_wallet_state_init(slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline_ref {
+    return begin_cell()
+    .store_uint(0, 2) ;; 0b00 - No split_depth; No special
+    .store_maybe_ref(jetton_wallet_code)
+    .store_maybe_ref(
+        pack_jetton_wallet_data(
+            0, ;; status
+            0, ;; balance
+            owner_address,
+            jetton_master_address)
+    )
+    .store_uint(0, 1) ;; Empty libraries
+    .end_cell();
+}

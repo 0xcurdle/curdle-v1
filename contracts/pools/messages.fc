@@ -1,0 +1,28 @@
+#include "../imports/stdlib.fc";
+#include "../common/opcodes.fc";
+#include "../pools/opcodes.fc";
+
+
+(cell) pack_deposit_asset(
+    int query_id, 
+    int deposit_amount, 
+    int min_lp_amount, 
+    int asset_index, 
+    slice provider
+) inline_ref {
+    var msg = begin_cell()
+        .store_op(op::deposit_asset)
+        .store_query_id(query_id)
+        .store_coins(deposit_amount)
+        .store_coins(min_lp_amount)
+        .store_uint(asset_index, const::key_size)
+        .store_slice(provider)
+        .end_cell();
+    return msg;
+}
+
+() swap_meta(
+) inline_ref {
+    ;; TODO
+    throw(error::not_implemeted);
+}

@@ -1,0 +1,29 @@
+global slice lp_account::pool_addr;
+global slice lp_account::recipient;
+global int lp_account::target;
+global int lp_account::current;
+global cell lp_account::balances;
+global int lp_account::query_id;
+
+() lp_account::load_data() impure inline_ref {
+    slice ds = get_data().begin_parse();
+    lp_account::pool_addr = ds~load_msg_addr();
+    lp_account::recipient = ds~load_msg_addr();
+    lp_account::target = ds~load_uint(const::key_size);
+    lp_account::current = ds~load_uint(const::key_size);
+    lp_account::query_id = ds~load_query_id();
+    lp_account::balances = ds~load_dict();
+}
+
+() lp_account::save_data() impure inline_ref {
+    set_data(
+        begin_cell()
+            .store_slice(lp_account::pool_addr)
+            .store_slice(lp_account::recipient)
+            .store_uint(lp_account::target, const::key_size)
+            .store_uint(lp_account::current, const::key_size)
+            .store_query_id(lp_account::query_id)
+            .store_dict(lp_account::balances)
+        .end_cell()
+    );
+}

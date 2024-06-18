@@ -1,0 +1,600 @@
+#include "imports/stdlib.fc";
+;; common import
+#include "common/constants.fc";
+#include "common/errors.fc";
+#include "common/opcodes.fc";
+#include "common/utils.fc";
+#include "common/workchain.fc";
+;; pool import
+#include "pools/gas.fc";
+#include "pools/logs.fc";
+#include "pools/messages.fc";
+#include "pools/storages.fc";
+#include "pools/utils.fc";
+;; lp_accounts import
+#include "lp_accounts/storages.fc";
+#include "lp_accounts/utils.fc";
+
+() internal::require_initialize() inline_ref {
+    if (pool::tadpoles != const::n_coins) {
+        ;; TODO: refund asset back as the pool is not ready
+        throw(error::not_initialized);
+    }
+}
+
+() internal::create_lp_account( ;; create lp account contract for providing liquidity
+    int query_id,
+    slice ctx::sender,
+    int ctx::value,      
+    int ctx::fwd_fee,
+    slice provider,      ;; address of the asset sender (ctx::sender for TON, jetton_sender for jetton)
+    int asset_index,     ;; index of the asset to deposit
+    int deposit_amount,  ;; amount of asset to deposit
+    int min_lp_amount,   ;; minimum amount of LP tokens to receive
+    int target,          ;; binary indexer of asset
+    slice recipient      ;; address to send LP tokens to
+) impure inline_ref {
+    cell state_init = get_lp_account_state_init(query_id, my_address(), provider, target, pool::lp_account_code);
+    slice lp_account_addr = get_address(state_init);
+    
+    cell body = pack_deposit_asset(query_id, deposit_amount, min_lp_amount, asset_index, provider);
+    deploy(BOUNCEABLE, lp_account_addr, ctx::value, body, state_init, SEND_MODE_REGULAR);
+    pool::save_data();
+}
+
+() internal::add_liquidity(
+    int query_id,    
+    int ctx::value,   
+    int ctx::fwd_fee,
+    slice recipient,    ;; address to send LP tokens to
+    slice provider,     ;; address of the asset provider
+    int target,         ;; binary indexer of asset
+    int min_lp_amount,  ;; minimum amount of LP tokens to receive
+    cell balances       ;; dictionary of asset balances {asset_index: amount}
+) impure inline_ref {
+    (
+        cell fees,
+        int mint_lp_amount, 
+        int fwd_ton
+    ) = simulate::add_liquidity(ctx::value, target, min_lp_amount, balances);
+
+    mint_lp(recipient, pool::jetton_lp_wallet_code, mint_lp_amount, query_id, fwd_ton);
+
+    log_add_liquidity(
+        provider,
+        recipient,
+        mint_lp_amount,
+        pool::total_supply_lp,
+        pool::A,
+        balances,
+        pool::reserves,
+        fees
+    );
+
+    pool::save_data();
+
+    return ();
+} 
+
+() internal::add_one_liquidity(
+    int query_id,     
+    int ctx::value,   
+    int ctx::fwd_fee,
+    slice recipient,    ;; address to send LP tokens to
+    slice provider,     ;; address of the asset provider
+    int target,         ;; binary indexer of asset
+    int min_lp_amount,  ;; minimum amount of LP tokens to receive
+    int asset_index,    ;; index of the asset to deposit
+    int deposit_amount  ;; amount of asset to deposit
+) impure inline {
+    cell balances = new_dict();
+    balances~udict_set(const::key_size, asset_index, begin_cell().store_coins(deposit_amount).end_cell().begin_parse());
+    return internal::add_liquidity(query_id, ctx::value, ctx::fwd_fee, recipient, provider, target, min_lp_amount, balances);
+}
+
+;; This function is only used for pool that has ton as one of the assets
+() internal::send_asset_back(int query_id, int index, slice recipient, int ton_amount, cell reject_payload, int amount_in) impure inline {
+    ;; Get jetton Wallet address
+    (slice jetton_wallet, int wallet_exist_ok?) = pool::assets_wallets.udict_get?(const::key_size, index);
+    if (wallet_exist_ok?) {
+        transfer_jetton(BOUNCEABLE, recipient, jetton_wallet~load_msg_addr(), amount_in, ton_amount, query_id, begin_cell().store_uint(0, 1).end_cell(), 0, SEND_MODE_REGULAR);
+    }
+}
+
+() handle::deposit( ;; create lp account contract if provide more than one asset as liquidity, otherwise add liquidity directly
+    int query_id,
+    slice ctx::sender,
+    int ctx::value,      
+    int ctx::fwd_fee,
+    int asset_index,     ;; index of the asset to deposit
+    slice provider,      ;; address of the asset sender (ctx::sender for TON, jetton_sender for jetton)
+    int deposit_amount,  ;; amount of asset to deposit
+    int min_lp_amount,   ;; minimum amount of LP tokens to receive
+    int target,          ;; binary indexer of asset
+    slice recipient      ;; address to send LP tokens to
+) impure inline_ref {
+    if (is_address_none(recipient)) { ;; if recipient is none, set sender as recipient
+        recipient = provider;
+    }
+
+    int gas_consume = 0;
+
+    if (is_provide_one_liquidity?(target)) { ;; if only provide one liquidity, then use add_liquidity
+        (int total_fee, gas_consume) = add_one_liquidity_fee(ctx::fwd_fee);
+        throw_unless(error::not_enough_ton, ctx::value > total_fee);
+        return internal::add_one_liquidity(query_id, ctx::value - gas_consume, ctx::fwd_fee, recipient, ctx::sender, target, min_lp_amount, asset_index, deposit_amount);
+    }
+
+    ;; Check that sending ton is enough to complete the transaction
+    (int total_fee, gas_consume) = deposit_fee(ctx::fwd_fee, 0);
+    throw_unless(error::not_enough_ton, ctx::value > total_fee);
+
+    return internal::create_lp_account(query_id, ctx::sender, ctx::value - gas_consume, ctx::fwd_fee, provider, asset_index, deposit_amount, min_lp_amount, target, recipient);
+}
+
+() handle::deposit_all(
+    int query_id,
+    slice ctx::sender,  
+    int ctx::value,
+    int ctx::fwd_fee,
+    slice recipient,     ;; address to send LP tokens to
+    slice provider,      ;; address of the asset sender
+    int target,          ;; binary indexer of asset
+    int min_lp_amount,   ;; minimum amount of LP tokens to receive
+    cell balances        ;; dictionary of asset balances {asset_index: amount}
+) impure inline_ref {
+    if (is_target_metapool?(target)) {
+        ;; TODO not implemented yet
+        throw(error::not_implemeted);
+    }
+    return internal::add_liquidity(query_id, ctx::value - deposit_all_fee(), ctx::fwd_fee, recipient, provider, target, min_lp_amount, balances);
+}
+
+() handle::swap( ;; swap function allows user to swap one asset for another. (swap is a keyword in funC, so we use swap instead)
+    int query_id,
+    slice ctx::sender,    ;; jetton wallet of token in
+    int ctx::value,
+    int ctx::fwd_fee,
+    slice provider,   ;; address of the asset sender (ctx::sender for TON, jetton_sender for jetton)
+    int token_in,         ;; index of the asset to swap
+    int token_out,        ;; index of the asset to receive
+    int amount_in,        ;; amount of asset to swap
+    int min_amount_out,   ;; minimum amount of asset to receive
+    int deadline,         ;; deadline for the swap
+    slice recipient,      ;; address to send swapped asset to
+    cell fulfill_payload, ;; payload to send if swap is successful
+    cell reject_payload   ;; payload to send if swap is unsuccessful
+) impure inline_ref {
+    (int total_fee, int gas_consume) = swap_fee(ctx::fwd_fee);
+    throw_unless(error::not_enough_ton, ctx::value > total_fee);
+    int ton_amount = ctx::value - gas_consume;
+
+    ;; if recipient is none, set sender as recipient
+    if (is_address_none(recipient)) { 
+        recipient = provider;
+    }
+    ;; Check if the deadline is passed
+    if ((now() > deadline)) {     
+        transfer_jetton(BOUNCEABLE, recipient, ctx::sender, amount_in, ton_amount, query_id, reject_payload, SEND_BACK_FEE, SEND_MODE_REGULAR);
+        return ();
+    }
+    if (token_in + token_out < 7){
+        ;; Base -> Base
+        (
+            pool::reserves, 
+            int amount_out, 
+            int swap_fee, 
+            int admin_fee_after
+        ) = simulate::get_amount_out(pool::reserves, token_in, token_out, amount_in);
+        
+        pool::admin_fee_balances~udict_set(const::key_size, token_out, begin_cell().store_coins(admin_fee_after).end_cell().begin_parse());
+        cell fees = new_dict();
+        fees~udict_set(const::key_size, token_out, begin_cell().store_coins(swap_fee).end_cell().begin_parse());
+
+        if (amount_out < min_amount_out) {
+            transfer_jetton(BOUNCEABLE, recipient, ctx::sender, amount_in, ton_amount, query_id, reject_payload, SEND_BACK_FEE, SEND_MODE_REGULAR);
+            return ();
+        }
+        (slice token_out_wallet, int ok?) = pool::assets_wallets.udict_get?(const::key_size, token_out);
+
+        transfer_jetton(BOUNCEABLE, recipient, token_out_wallet~load_msg_addr(), amount_out, ton_amount, query_id, fulfill_payload, 0, SEND_MODE_REGULAR);
+
+        cell swap_data = begin_cell()
+            .store_uint(token_in, const::key_size)
+            .store_uint(token_out, const::key_size)
+            .store_coins(amount_in)
+            .store_coins(amount_out)
+            .end_cell();
+
+        log_swap(
+            provider,
+            recipient,
+            pool::total_supply_lp,
+            pool::A,
+            swap_data,
+            pool::reserves,
+            fees
+        );
+        
+        pool::save_data();
+
+        return ();
+    }
+
+    ;; Base -> Metapool
+    return ();
+}
+
+() handle::take_wallet_address(
+    slice ctx::sender,
+    slice wallet_address
+) impure inline_ref {
+    (int key, slice master_address, int flag) = pool::assets.udict_get_min?(const::key_size);
+    while (flag) {
+        if (equal_slices(master_address, ctx::sender)) {
+            pool::assets_wallets~udict_set(const::key_size, key, wallet_address);
+            (pool::wallet_indexes, int ok?) = pfxdict_set?(pool::wallet_indexes, 267, wallet_address, begin_cell().store_uint(key, const::key_size).end_cell().begin_parse());
+            flag = 0;
+            pool::tadpoles += 1;
+        } else {
+            (key, master_address, flag) = pool::assets.udict_get_next?(const::key_size, key);
+        }
+    }
+
+    pool::save_data();
+
+    return ();
+}
+
+() handle::top_up(
+    int query_id,
+    slice ctx::sender,
+    int ctx::value,      
+    int ctx::fwd_fee
+) impure inline_ref {
+    int send_ton = (ctx::value - 500000000) / const::n_coins;
+    throw_unless(error::not_enough_ton, ctx::value > DEPLOY_POOL_FEE);
+
+    int incr = 1;
+    int pre_hash = -1;
+    repeat(const::n_coins) {
+        (slice jetton_master, int ok?) = pool::assets.udict_get?(const::key_size, incr);
+        int hash = 0;
+        if ok? {
+            hash = jetton_master.slice_hash();
+            cell msg = pack_provide_wallet_address(jetton_master, send_ton, query_id);
+            send_raw_message(msg, 0);
+        }
+        throw_unless(error::invalid_asset_order, hash > pre_hash);
+        pre_hash = hash; 
+        incr <<= 1;
+    }
+    return ();
+}
+
+() handle::rm_liquidity_all(
+    int query_id,
+    slice ctx::sender, 
+    int ctx::value, 
+    int ctx::fwd_fee,
+    int remove_amount,
+    slice remover,
+    slice recipient
+) impure inline {
+    ;; check if sender is LP token wallet
+    cell state_init = calculate_jetton_wallet_state_init(my_address(), my_address(), pool::jetton_lp_wallet_code);
+    slice jetton_wallet_address = get_address(state_init);
+    throw_unless(error::invalid_sender, equal_slices_bits(ctx::sender, jetton_wallet_address));
+    throw_unless(error::remove_zero_lp, remove_amount > 0);
+
+    if is_address_none(recipient) {
+        recipient = remover;
+    }
+
+    (int total_fee, int gas_consume) = remove_liquidity_fee(ctx::fwd_fee, 0);
+    throw_unless(error::not_enough_ton, ctx::value > total_fee);
+    int send_ton = (ctx::value - gas_consume) / const::n_coins;
+
+    cell amount_outs = simulate::remove_liquidity_all(remove_amount);
+
+    ;; Remove Liquidity Back
+    int incr = 1;
+    repeat(const::n_coins) {
+        (slice asset_amount_out_slice, int ok?) = amount_outs.udict_get?(const::key_size, incr);
+        if (ok?){
+            ;; ;; Get jetton Wallet address
+            ;; (slice jetton_wallet, int wallet_exist_ok?) = pool::assets_wallets.udict_get?(const::key_size, incr);
+            ;; if (wallet_exist_ok?) {
+            ;;     int amount_in = asset_amount_out_slice~load_coins();
+            ;;     transfer_jetton(BOUNCEABLE, recipient, jetton_wallet~load_msg_addr(), amount_in, send_ton, query_id, begin_cell().store_uint(0, 1).end_cell(), 0, SEND_MODE_REGULAR);
+            ;; }
+            int amount_in = asset_amount_out_slice~load_coins();
+            internal::send_asset_back(query_id, incr, recipient, send_ton, begin_cell().store_uint(0, 1).end_cell(), amount_in);
+        }
+        incr <<= 1;
+    }
+
+    pool::save_data();
+    return ();
+}
+
+() handle::rm_liquidity_one(
+    int query_id,
+    slice ctx::sender,
+    int ctx::value,
+    int ctx::fwd_fee,
+    int remove_amount,
+    slice remover,
+    slice recipient,    ;; address to send jetton to
+    int token_out,      ;; index of the asset to receive
+    int min_amount_out  ;; minimum amount of asset to receive
+) impure inline {
+    ;; check if sender is LP token wallet
+    cell state_init = calculate_jetton_wallet_state_init(my_address(), my_address(), pool::jetton_lp_wallet_code);
+    slice jetton_wallet_address = get_address(state_init);
+    throw_unless(error::invalid_sender, equal_slices_bits(ctx::sender, jetton_wallet_address));
+    throw_unless(error::remove_zero_lp, remove_amount > 0);
+
+    ;; Calculate sending ton is enough to complete the transaction
+    (int total_fee, int gas_consumption) = remove_liquidity_fee(ctx::fwd_fee, 1);
+    throw_unless(error::not_enough_ton, ctx::value > total_fee);
+    int send_ton = (ctx::value - gas_consumption);
+
+    if is_address_none(recipient) {
+        recipient = remover;
+    }
+
+    ;; Calculate with one coin
+    (cell amount_outs, cell fees, int d_y, int d_y_fee) = simulate::remove_liquidity_one(remove_amount, token_out);
+
+    throw_unless(error::not_meet_min_amount, d_y > min_amount_out);
+
+    ;; Remove Liquidity Back
+    internal::send_asset_back(query_id, token_out, recipient, send_ton, begin_cell().store_uint(0, 1).end_cell(), d_y);
+    
+    log_remove_liquidity(
+        remover,
+        recipient,
+        remove_amount,
+        pool::total_supply_lp,
+        pool::A,
+        amount_outs,
+        pool::reserves,
+        fees
+    );
+
+    pool::save_data();
+    return ();
+}
+
+() route_internal(slice ctx::sender, int ctx::value, int ctx::fwd_fee, slice ctx::body) impure inline {
+    ;; load op and query id
+    (int op, int query_id) = ctx::body~load_op_and_query_id();
+
+    ;; Load data from storage
+    pool::load_data();
+
+    ;; dispatch
+    if op == op::transfer_notification { ;; receive jetton transfer notification
+        internal::require_initialize();
+
+        int jetton_amount = ctx::body~load_coins();
+        slice jetton_sender = ctx::body~load_msg_addr();
+        slice forward_payload = ctx::body~load_ref().begin_parse();
+
+        op = forward_payload~load_op(); ;; op MUST be the first 32 bits of the payload in this case
+
+        if (op == op::deposit) {
+            int min_lp_amount = forward_payload~load_coins();
+            int target = forward_payload~load_uint(const::key_size);
+            slice recipient = forward_payload~load_msg_addr();
+            int asset_index = pool::wallet_indexes.get_asset_index(ctx::sender);
+            return handle::deposit(query_id, ctx::sender, ctx::value, ctx::fwd_fee, asset_index, jetton_sender, jetton_amount, min_lp_amount, target, recipient);
+        }
+
+        if (op == op::swap) {
+            int token_out = forward_payload~load_uint(const::key_size);
+            int min_amount_out = forward_payload~load_coins();
+            int deadline = forward_payload~load_uint(32);
+            slice recipient = forward_payload~load_msg_addr();
+            cell fulfill_payload = forward_payload~load_maybe_ref();
+            cell reject_payload = forward_payload~load_maybe_ref();
+            int token_in = pool::wallet_indexes.get_asset_index(ctx::sender);
+            throw_unless(error:invalid_swap , token_in != token_out);
+            return handle::swap(query_id, ctx::sender, ctx::value, ctx::fwd_fee, jetton_sender, token_in, token_out, jetton_amount, min_amount_out, deadline, recipient, fulfill_payload, reject_payload);
+        }
+
+        if op == op::rm_liquidity_all {
+            slice recipient = forward_payload~load_msg_addr();
+            return handle::rm_liquidity_all(query_id, ctx::sender, ctx::value, ctx::fwd_fee, jetton_amount, jetton_sender, recipient);
+        }
+
+        if op == op::rm_liquitiy_one {
+            slice recipient = forward_payload~load_msg_addr();
+            int token_out = forward_payload~load_uint(const::key_size);
+            int min_amount_out = forward_payload~load_coins();
+            return handle::rm_liquidity_one(query_id, ctx::sender, ctx::value, ctx::fwd_fee, jetton_amount, jetton_sender, recipient, token_out, min_amount_out);
+        }
+
+        throw(error::invalid_op);
+    }
+
+    if op == op::deposit_all { ;; deposit more than one asset as liquidity, send from lp account contract
+        internal::require_initialize();
+        slice recipient = ctx::body~load_msg_addr();
+        slice provider = ctx::body~load_msg_addr();
+        int target = ctx::body~load_uint(const::key_size);
+        int min_lp_amount = ctx::body~load_coins();
+        cell balances = ctx::body~load_dict();
+        ;; Check if ctx::sender is lp account contract
+        cell state_init = get_lp_account_state_init(query_id, my_address(), recipient, target, pool::lp_account_code);
+        slice lp_account_address = get_address(state_init);
+        throw_unless(error:only_lp_account_can_send, equal_slices_bits(ctx::sender, lp_account_address));
+        return handle::deposit_all(query_id, ctx::sender, ctx::value, ctx::fwd_fee, recipient, provider, target, min_lp_amount, balances);
+    }
+
+    if op == op::top_up {
+        ;; Only owner can set up the contract
+        throw_unless(error::invalid_sender, equal_slices_bits(pool::owner_address, ctx::sender));
+        return handle::top_up(query_id, ctx::sender, ctx::value, ctx::fwd_fee);
+    }
+
+    if op == op::take_wallet_address {
+        ;; Only when tadpoles < const::n_coins, Pool can receive op::take_wallet_address
+        throw_unless(error::already_inited, pool::tadpoles < const::n_coins);
+        slice wallet_address = ctx::body~load_msg_addr();
+        return handle::take_wallet_address(ctx::sender, wallet_address);
+    }
+
+    if op == op::upgrade {
+        ;; Only owner can upgrade the contract
+        throw_unless(error::invalid_sender, equal_slices_bits(pool::owner_address, ctx::sender));
+        cell new_code = ctx::body~load_ref();
+        set_code(new_code);
+        return ();
+    }
+
+    throw(error::invalid_op);
+}
+
+() main(int ctx::value, cell in_msg_full, slice ctx::body) impure {
+    slice s = in_msg_full.begin_parse();
+    int flags = s~load_msg_flags();
+
+    if (is_bounced(flags)) { ;; skip all bounced messages
+        return ();
+    }
+    
+    ;; get context
+    (slice ctx::sender, int ctx::fwd_fee) = s~retrieve_ctx(MY_WORKCHAIN);
+
+    ;; route function to handle internal message
+    route_internal(ctx::sender, ctx::value, ctx::fwd_fee, ctx::body);
+}
+
+;; Get methods
+
+slice get_lp_account_address(int query_id, slice user_address, int target) method_id {
+    pool::load_data();
+    cell state_init = get_lp_account_state_init(query_id, my_address(), user_address, target, pool::lp_account_code);
+    slice lp_account_address = get_address(state_init);
+    return lp_account_address;
+}
+
+(   
+    slice, cell, cell, cell, cell, cell, 
+    cell, cell, cell, int, int, int, 
+    int, int, int, int, int, int, cell
+) get_pool_data() method_id {
+    pool::load_data();
+    return (
+        pool::owner_address,
+        pool::assets,
+        pool::assets_wallets,
+        pool::wallet_indexes,
+        pool::reserves,
+        pool::admin_fee_balances,
+        pool::lp_account_code,
+        pool::jetton_lp_wallet_code,
+        pool::meta_pool_code,
+        pool::total_supply_lp,
+        pool::fee,
+        pool::admin_fee,
+        pool::A,
+        pool::init_A_time,
+        pool::future_A,
+        pool::future_A_time,
+        pool::n_meta,
+        pool::tadpoles,
+        pool::lp_content
+    );
+}
+
+cell get_reserves() method_id {
+    pool::load_data();
+    return pool::reserves;
+}
+
+cell get_admin_fee_balances() method_id {
+    pool::load_data();
+    return pool::admin_fee_balances;
+}
+
+slice get_wallet_address(slice owner_address) method_id {
+    pool::load_data();
+    return get_address(calculate_jetton_wallet_state_init(owner_address, my_address(), pool::jetton_lp_wallet_code));
+}
+
+int get_total_supply_lp() method_id {
+    pool::load_data();
+    return pool::total_supply_lp;
+}
+
+(int, int, slice, cell, cell) get_jetton_data() method_id {
+    pool::load_data();
+    int total_supply = pool::total_supply_lp;
+    slice admin_address = pool::owner_address;
+    cell jetton_wallet_code = pool::jetton_lp_wallet_code;
+    int mintable = TRUE;
+    return (total_supply, mintable, admin_address, pool::lp_content, jetton_wallet_code);
+}
+
+(int, int, int, int) get_simulate_add_liquidity(int target, cell balances) method_id {
+    pool::load_data();
+    int virtual_price_before = get_virtual_price(pool::reserves, pool::A, pool::total_supply_lp);
+    (
+        cell fees,
+        int mint_lp_amount, 
+        _
+    ) = simulate::add_liquidity(0, target, 0, balances);
+
+    int virtual_price_after = get_virtual_price(pool::reserves, pool::A, pool::total_supply_lp);
+
+    return (mint_lp_amount, pool::total_supply_lp, virtual_price_before, virtual_price_after);
+}
+
+(int, int, int, int) get_simulate_swap(int token_in, int token_out, int amount_in) method_id {
+    pool::load_data();
+
+    int virtual_price_before = get_virtual_price(pool::reserves, pool::A, pool::total_supply_lp);
+
+    (
+        cell reserves, 
+        int amount_out, 
+        int swap_fee, 
+        int admin_fee_after
+    ) = simulate::get_amount_out(pool::reserves, token_in, token_out, amount_in);
+
+    int virtual_price_after = get_virtual_price(reserves, pool::A, pool::total_supply_lp);
+
+    return (amount_out, swap_fee, virtual_price_before, virtual_price_after);
+}
+
+(cell, int, int, int) get_simulate_remove_liquidity_all(int remove_amount) method_id {
+    pool::load_data();
+
+    int virtual_price_before = get_virtual_price(pool::reserves, pool::A, pool::total_supply_lp);
+
+    cell amount_outs = simulate::remove_liquidity_all(remove_amount);
+
+    int virtual_price_after = get_virtual_price(pool::reserves, pool::A, pool::total_supply_lp);
+
+    return (amount_outs, pool::total_supply_lp, virtual_price_before, virtual_price_after);
+}
+
+(int, int, int, int, int) get_simulate_remove_liquidity_one(int remove_amount, int token_out) method_id {
+    pool::load_data();
+
+    int virtual_price_before = get_virtual_price(pool::reserves, pool::A, pool::total_supply_lp);
+
+    (
+        cell amount_outs, 
+        cell fees, 
+        int d_y, 
+        int d_y_fee
+    ) = simulate::remove_liquidity_one(remove_amount, token_out);
+
+    int virtual_price_after = get_virtual_price(pool::reserves, pool::A, pool::total_supply_lp);
+
+    return (d_y, d_y_fee, pool::total_supply_lp, virtual_price_before, virtual_price_after);
+}

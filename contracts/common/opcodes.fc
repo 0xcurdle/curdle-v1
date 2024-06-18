@@ -1,0 +1,13 @@
+
+;; common opcodes
+const op::comments = 0;
+const op::top_up = 0xd372158c;
+const op::provide_wallet_address = 0x2c76b973;
+const op::take_wallet_address = 0xd1735400;
+const op::transfer_notification = 0x7362d09c;
+const op::internal_transfer = 0x178d4519;
+const op::transfer = 0xf8a7ea5;
+const op::excesses = 0xd53276db;
+const op::burn = 0x595f07bc;
+const op::burn_notification = 0x7bdd97de;
+const op::event_log = "event_log"c; ;;9ef0ad16

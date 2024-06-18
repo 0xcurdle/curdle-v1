@@ -1,0 +1,10 @@
+;; pool opcodes
+const op::deposit = "deposit"c; ;; 95db9d39
+const op::deposit_ton = "deposit_ton"c; ;; 33fcdcc4
+const op::deposit_asset = "deposit_asset"c; ;; 88f94787
+const op::swap = "swap"c; ;; 25938561
+const op::swap_ton = "swap_ton"c; ;; dcb17fc0
+const op::deposit_all = "deposit_all"c; ;; ec328fb0
+const op::upgrade = "upgrade"c; ;; b766741a
+const op::rm_liquidity_all = "rm_liquidity_all"c; ;; fca589a2
+const op::rm_liquitiy_one = "rm_liquidity_one"c; ;; bdd17e8e
